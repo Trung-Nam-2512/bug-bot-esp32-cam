@@ -1,5 +1,6 @@
 #include "CameraDriver.h"
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 
 // ==== AI Thinker ESP32-CAM pinout ====
 #define PWDN_GPIO_NUM 32
@@ -23,14 +24,8 @@ using namespace cam;
 
 bool CameraDriver::initPins() { return true; }
 
-bool CameraDriver::begin(int frameSize, int jpegQuality, int flashGpio, bool flashActiveHigh)
+bool CameraDriver::begin(int frameSize, int jpegQuality)
 {
-    flashGpio_ = flashGpio;
-    flashHigh_ = flashActiveHigh;
-
-    pinMode(flashGpio_, OUTPUT);
-    flashOff(); // đảm bảo tắt từ đầu
-
     camera_config_t config = {};
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -57,14 +52,16 @@ bool CameraDriver::begin(int frameSize, int jpegQuality, int flashGpio, bool fla
     {
         config.frame_size = (framesize_t)frameSize;
         config.jpeg_quality = jpegQuality;
-        config.fb_count = 2;
+        config.fb_count = 3; // Cần ít nhất 2 buffer để tránh overflow
     }
     else
     {
-        config.frame_size = FRAMESIZE_UXGA; // ép luôn
-        config.jpeg_quality = 5;
-        config.fb_count = 1;
+        config.frame_size = FRAMESIZE_SVGA; // Giảm resolution nếu không có PSRAM
+        config.jpeg_quality = 10;
+        config.fb_count = 3; // Tăng lên 2 để tránh overflow
     }
+
+    esp_task_wdt_reset();
 
     if (esp_camera_init(&config) != ESP_OK)
     {
@@ -84,28 +81,48 @@ bool CameraDriver::begin(int frameSize, int jpegQuality, int flashGpio, bool fla
         s->set_bpc(s, 1);
         s->set_wpc(s, 1);
     }
+
     return true;
 }
 
-void CameraDriver::flashOn() { digitalWrite(flashGpio_, flashHigh_ ? HIGH : LOW); }
-void CameraDriver::flashOff() { digitalWrite(flashGpio_, flashHigh_ ? LOW : HIGH); }
-
-// Bật flash -> preflash -> bỏ warmup frames -> chụp -> tắt flash
-camera_fb_t *CameraDriver::captureHQ(uint8_t warmupFrames, uint16_t preFlashMs)
+void CameraDriver::end()
 {
-    flashOn();
-    delay(preFlashMs);
+    esp_camera_deinit();
+}
 
+camera_fb_t *CameraDriver::captureHQ(uint8_t warmupFrames)
+{
+    // Warmup frames - đảm bảo release ngay để tránh overflow
     for (uint8_t i = 0; i < warmupFrames; ++i)
     {
+        esp_task_wdt_reset();
         camera_fb_t *tmp = esp_camera_fb_get();
         if (tmp)
+        {
             esp_camera_fb_return(tmp);
-        delay(25);
+            delay(20); // Delay để camera xử lý xong
+        }
+        else
+        {
+            delay(30); // Nếu lỗi, delay lâu hơn
+        }
     }
 
+    // Delay trước khi chụp để đảm bảo camera sẵn sàng
+    delay(100);
+
+    // Chụp ảnh với retry
+    esp_task_wdt_reset();
     camera_fb_t *fb = esp_camera_fb_get();
-    flashOff();
+
+    // Retry nếu lỗi (có thể do overflow)
+    if (!fb)
+    {
+        delay(200);
+        esp_task_wdt_reset();
+        fb = esp_camera_fb_get();
+    }
+
     return fb;
 }
 
